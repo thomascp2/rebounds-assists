@@ -14,6 +14,7 @@ Output:
 """
 
 import logging
+import unicodedata
 from difflib import get_close_matches
 
 import pandas as pd
@@ -28,6 +29,20 @@ logger = logging.getLogger(__name__)
 _NAME_SUFFIXES = {" jr", " sr", " ii", " iii", " iv", " v"}
 
 
+def _ascii_fold(name: str) -> str:
+    """
+    Normalize Unicode diacritics to plain ASCII.
+    e.g. 'Luka Dončić' → 'luka doncic', 'Nikola Jokić' → 'nikola jokic'
+    """
+    return (
+        unicodedata.normalize("NFKD", name)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+        .strip()
+    )
+
+
 def _strip_suffix(name: str) -> str:
     """Remove generational suffixes so 'Trey Murphy' matches 'Trey Murphy III'."""
     for suffix in _NAME_SUFFIXES:
@@ -39,39 +54,50 @@ def _strip_suffix(name: str) -> str:
 def _build_name_lookup(active_players: pd.DataFrame) -> dict[str, int]:
     """
     Builds a dict of {normalized_name: PERSON_ID} for fuzzy matching.
-    Stores both the full name and suffix-stripped version so either can match.
+    Stores the original lowercase name, the ASCII-folded version, and
+    suffix-stripped variants so any combination can match.
     """
     lookup = {}
     for _, row in active_players.iterrows():
-        name = str(row.get("DISPLAY_FIRST_LAST", "")).strip().lower()
+        raw = str(row.get("DISPLAY_FIRST_LAST", "")).strip()
         pid = int(row["PERSON_ID"])
-        if name:
-            lookup[name] = pid
-            stripped = _strip_suffix(name)
-            if stripped != name:
+        if not raw:
+            continue
+
+        for variant in {raw.lower(), _ascii_fold(raw)}:
+            lookup[variant] = pid
+            stripped = _strip_suffix(variant)
+            if stripped != variant:
                 lookup[stripped] = pid
+
     return lookup
 
 
 def _match_player_name(pp_name: str, lookup: dict[str, int]) -> int | None:
     """
-    Attempts exact match → suffix-stripped exact match → fuzzy match.
+    Attempts exact match → ASCII-folded match → suffix-stripped match → fuzzy match.
     Returns the PERSON_ID or None if not found.
     """
     normalized = pp_name.strip().lower()
+    folded = _ascii_fold(pp_name)
 
+    # 1. Exact lowercase match
     if normalized in lookup:
         return lookup[normalized]
 
-    # Try stripping suffix from the PP name (e.g. PP sends "Trey Murphy" but
-    # NBA has "Trey Murphy III" — the lookup stores the stripped version too)
-    stripped = _strip_suffix(normalized)
-    if stripped in lookup:
-        logger.debug("Suffix-stripped match '%s' → '%s'", pp_name, stripped)
-        return lookup[stripped]
+    # 2. ASCII-folded match (handles diacritics: Dončić → doncic)
+    if folded in lookup:
+        logger.debug("ASCII-folded match '%s' → '%s'", pp_name, folded)
+        return lookup[folded]
 
-    # Fuzzy fallback against all keys (includes stripped variants)
-    matches = get_close_matches(normalized, lookup.keys(), n=1, cutoff=0.82)
+    # 3. Suffix-stripped variants
+    for candidate in {_strip_suffix(normalized), _strip_suffix(folded)}:
+        if candidate in lookup:
+            logger.debug("Suffix-stripped match '%s' → '%s'", pp_name, candidate)
+            return lookup[candidate]
+
+    # 4. Fuzzy fallback against all keys (includes folded + stripped variants)
+    matches = get_close_matches(folded, lookup.keys(), n=1, cutoff=0.82)
     if matches:
         logger.debug("Fuzzy matched '%s' → '%s'", pp_name, matches[0])
         return lookup[matches[0]]
