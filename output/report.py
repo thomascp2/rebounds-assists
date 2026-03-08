@@ -111,11 +111,12 @@ def print_console_report(scored_df: pd.DataFrame, top_n: int = TOP_N_DISPLAY) ->
         std_s      = _fmt(row.get("rolling_stat_std"))
         mins_s     = _fmt(row.get("avg_minutes"))
         games_s    = _fmt(row.get("games_sampled"), fmt="d")
+        season_s   = _fmt(row.get("season_avg"))
 
         print(f"       ── Features ──────────────────────────────────────────")
         print(f"       Game Pace:    {pace_s} pos/48")
         print(f"       Books Line:   {cons_s}  (gap vs PP: {gap_s})")
-        print(f"       Last {games_s}g Avg:  {avg_s}  (±{std_s})  Mins: {mins_s}")
+        print(f"       Last {games_s}g Avg:  {avg_s}  (±{std_s})  Mins: {mins_s}  Season: {season_s}")
 
         # Trend block — only show when we have multi-window data
         l5_avg  = row.get("l5_avg")

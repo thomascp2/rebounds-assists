@@ -295,6 +295,70 @@ def attach_player_advanced_stats(
     return df
 
 
+# ── Season Averages ───────────────────────────────────────────────────────────
+
+# Maps stat_category → which advanced-stats column(s) to pull season avg from
+_SEASON_AVG_COL: dict[str, str | tuple] = {
+    "Rebs+Asts": ("SEASON_AVG_REB", "SEASON_AVG_AST"),  # sum both
+    "Points":    "SEASON_AVG_PTS",
+    "Rebounds":  "SEASON_AVG_REB",
+    "Assists":   "SEASON_AVG_AST",
+    "3PM":       "SEASON_AVG_3PM",
+}
+
+
+def attach_season_averages(
+    df: pd.DataFrame,
+    player_advanced: pd.DataFrame,
+    name_lookup: dict[str, int],
+) -> pd.DataFrame:
+    """
+    Attaches season_avg — the full-season per-game average for the prop's stat.
+    Uses the same player_advanced DataFrame already fetched in Step 2.
+    Provides a stable baseline to complement the short rolling-form windows.
+    """
+    df = df.copy()
+    df["season_avg"] = None
+
+    if player_advanced is None or player_advanced.empty:
+        return df
+
+    adv_map: dict[int, dict] = {}
+    for _, row in player_advanced.iterrows():
+        pid = int(row["PLAYER_ID"])
+        adv_map[pid] = {
+            "SEASON_AVG_PTS": row.get("SEASON_AVG_PTS"),
+            "SEASON_AVG_REB": row.get("SEASON_AVG_REB"),
+            "SEASON_AVG_AST": row.get("SEASON_AVG_AST"),
+            "SEASON_AVG_3PM": row.get("SEASON_AVG_3PM"),
+        }
+
+    for idx, row in df.iterrows():
+        pid = row.get("nba_player_id")
+        if pid is None or pd.isna(pid):
+            pid = _match_player_name(row["player_name"], name_lookup)
+        if pid is None:
+            continue
+
+        stats = adv_map.get(int(pid), {})
+        cat = row.get("stat_category", "")
+        col_spec = _SEASON_AVG_COL.get(cat)
+        if col_spec is None:
+            continue
+
+        if isinstance(col_spec, tuple):
+            vals = [stats.get(c) for c in col_spec]
+            if all(v is not None and not (isinstance(v, float) and pd.isna(v)) for v in vals):
+                df.at[idx, "season_avg"] = round(sum(float(v) for v in vals), 1)
+        else:
+            val = stats.get(col_spec)
+            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                df.at[idx, "season_avg"] = round(float(val), 1)
+
+    df["season_avg"] = pd.to_numeric(df["season_avg"], errors="coerce")
+    return df
+
+
 # ── Multi-stat Rolling Form ───────────────────────────────────────────────────
 
 def _window_stats(series: pd.Series, pp_line: float, n: int) -> tuple[float | None, float | None]:
@@ -597,6 +661,10 @@ def build_feature_dataframe(
     # 7. Player advanced stats (optional — graceful if missing)
     df = attach_player_advanced_stats(df, player_advanced_stats, name_lookup)
     logger.info("✓ Player advanced stats attached.")
+
+    # 7b. Season averages (full-season baseline per stat category)
+    df = attach_season_averages(df, player_advanced_stats, name_lookup)
+    logger.info("✓ Season averages attached.")
 
     # 8. Sportsbook line gap (multi-stat)
     df = attach_line_gap_multi(df, all_consensus_lines)

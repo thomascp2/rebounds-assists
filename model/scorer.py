@@ -439,6 +439,7 @@ def score_row(row: pd.Series) -> dict | None:
         "trend_direction":   str(row.get("trend_direction") or "unknown"),
         "trend_pct":         _sf(row.get("trend_pct")),
         "trend_is_valid":    bool(row.get("trend_is_valid", False)),
+        "season_avg":        _sf(row.get("season_avg")),
         "recent_3pt_pct":    _sf(row.get("recent_3pt_pct")),
         "fg3a_per_game":     _sf(row.get("fg3a_per_game")),
         "usg_pct":           _sf(row.get("usg_pct")),
@@ -456,6 +457,8 @@ def score_row(row: pd.Series) -> dict | None:
         "ev_tier":           ev_tier,
         # Correlation warning populated later
         "correlation_warning": "",
+        # ML outcome — filled post-game by ml/backfill_outcomes.py
+        "hit": None,
     }
 
 

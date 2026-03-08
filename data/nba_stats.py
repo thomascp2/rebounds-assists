@@ -272,10 +272,19 @@ def fetch_player_advanced_stats() -> pd.DataFrame:
     adv_want = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "USG_PCT", "REB_PCT", "AST_PCT"]
     adv_result = adv_df[[c for c in adv_want if c in adv_df.columns]].copy()
 
-    if "FG3A" in base_df.columns and "PLAYER_ID" in base_df.columns:
-        base_result = base_df[["PLAYER_ID", "FG3A"]].copy()
-        base_result = base_result.rename(columns={"FG3A": "FG3A_PER_GAME"})
-        base_result["FG3A_PER_GAME"] = pd.to_numeric(base_result["FG3A_PER_GAME"], errors="coerce")
+    if "PLAYER_ID" in base_df.columns:
+        _base_rename = {
+            "FG3A": "FG3A_PER_GAME",
+            "PTS":  "SEASON_AVG_PTS",
+            "REB":  "SEASON_AVG_REB",
+            "AST":  "SEASON_AVG_AST",
+            "FG3M": "SEASON_AVG_3PM",
+        }
+        base_want = ["PLAYER_ID"] + [c for c in _base_rename if c in base_df.columns]
+        base_result = base_df[base_want].copy().rename(columns=_base_rename)
+        for col in base_result.columns:
+            if col != "PLAYER_ID":
+                base_result[col] = pd.to_numeric(base_result[col], errors="coerce")
         result = adv_result.merge(base_result, on="PLAYER_ID", how="left")
     else:
         result = adv_result
