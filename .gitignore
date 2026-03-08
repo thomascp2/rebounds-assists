@@ -33,6 +33,10 @@ data/api_schemas/
 .DS_Store
 Thumbs.db
 
+# Machine-specific launchers (contain local paths)
+*.bat
+*.ps1
+
 # Secrets — never commit these
 .env
 secrets.py
