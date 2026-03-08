@@ -297,21 +297,75 @@ def attach_player_advanced_stats(
 
 # ── Multi-stat Rolling Form ───────────────────────────────────────────────────
 
+def _window_stats(series: pd.Series, pp_line: float, n: int) -> tuple[float | None, float | None]:
+    """Returns (avg, hit_rate) for the last n games in series. None if insufficient data."""
+    s = series.iloc[:n].dropna()
+    if len(s) < max(3, n // 2):   # need at least half the window filled to be meaningful
+        return None, None
+    return round(float(s.mean()), 2), round(float((s >= pp_line).mean()), 3)
+
+
+def _compute_trend(l5_avg, l10_avg, l15_avg) -> tuple[str, float | None]:
+    """
+    Returns (trend_direction, trend_pct) based on L5 vs L15.
+
+    trend_direction:
+        "up"   — L5 avg >= L10 avg >= L15 avg (consistently improving)
+        "down" — L5 avg <= L10 avg <= L15 avg (consistently declining)
+        "flat" — within ±5% of L15 avg
+        "mixed"— no clear monotonic trend
+
+    trend_pct: (L5_avg - L15_avg) / L15_avg  — magnitude of shift.
+               Positive = trending up, negative = trending down.
+               None if L5 or L15 unavailable.
+    """
+    if l5_avg is None or l15_avg is None or l15_avg == 0:
+        return "unknown", None
+
+    trend_pct = round((l5_avg - l15_avg) / l15_avg, 4)
+
+    if abs(trend_pct) <= 0.05:
+        return "flat", trend_pct
+
+    if l10_avg is not None:
+        if l5_avg >= l10_avg >= l15_avg:
+            return "up", trend_pct
+        if l5_avg <= l10_avg <= l15_avg:
+            return "down", trend_pct
+        return "mixed", trend_pct
+
+    # L10 unavailable — fall back to L5 vs L15 only
+    return ("up" if trend_pct > 0 else "down"), trend_pct
+
+
 def compute_player_form_multi(
     df: pd.DataFrame,
     player_logs: dict[int, pd.DataFrame],
     name_lookup: dict[str, int],
 ) -> pd.DataFrame:
     """
-    Computes rolling form stats for every prop using a variance-aware window.
+    Computes rolling form stats for every prop using a variance-aware primary window,
+    plus fixed L5 / L10 / L15 windows for trend detection.
 
-    Generic output columns (used by scorer for all stat categories):
+    Primary window columns:
         rolling_stat_avg, rolling_stat_std, stat_hit_rate, avg_minutes, games_sampled
+
+    Multi-window columns:
+        l5_avg,  l5_hit_rate
+        l10_avg, l10_hit_rate
+        l15_avg, l15_hit_rate
+
+    Trend columns:
+        trend_direction  — "up" | "down" | "flat" | "mixed" | "unknown"
+        trend_pct        — (L5_avg - L15_avg) / L15_avg  (signed magnitude)
+        trend_is_valid   — True only when L5 avg >= PP line AND L5 hit_rate >= 0.60
+                           Guards against trusting a small-sample uptrend that is
+                           still below the line.
 
     Legacy Rebs+Asts columns (backwards compat):
         rolling_ra_avg, rolling_ra_std, hit_rate
 
-    Additional per-stat averages for display:
+    Per-stat display columns:
         rolling_pts_avg, rolling_reb_avg, rolling_ast_avg, rolling_3pm_avg, recent_3pt_pct
     """
     df = df.copy()
@@ -319,6 +373,10 @@ def compute_player_form_multi(
     all_new_cols = [
         "rolling_stat_avg", "rolling_stat_std", "stat_hit_rate",
         "avg_minutes", "games_sampled",
+        "l5_avg",  "l5_hit_rate",
+        "l10_avg", "l10_hit_rate",
+        "l15_avg", "l15_hit_rate",
+        "trend_direction", "trend_pct", "trend_is_valid",
         "rolling_ra_avg", "rolling_ra_std", "hit_rate",
         "rolling_pts_avg", "rolling_reb_avg", "rolling_ast_avg",
         "rolling_3pm_avg", "recent_3pt_pct",
@@ -327,13 +385,13 @@ def compute_player_form_multi(
         df[col] = None
 
     for idx, row in df.iterrows():
-        pp_name = row["player_name"]
-        pp_line = row["line"]
+        pp_name  = row["player_name"]
+        pp_line  = row["line"]
         stat_cat = row.get("stat_category", "Rebs+Asts")
 
-        variance = VARIANCE_TIER.get(stat_cat, "medium")
+        variance    = VARIANCE_TIER.get(stat_cat, "medium")
         form_window = FORM_WINDOW_BY_VARIANCE.get(variance, 10)
-        stat_col = _STAT_LOG_COL.get(stat_cat, "RA")
+        stat_col    = _STAT_LOG_COL.get(stat_cat, "RA")
 
         pid = row.get("nba_player_id")
         if pid is None or pd.isna(pid):
@@ -345,31 +403,64 @@ def compute_player_form_multi(
         if log.empty or stat_col not in log.columns:
             continue
 
-        log_filtered = log[log["MIN"] >= MIN_MINUTES_THRESHOLD].head(form_window)
-        if log_filtered.empty:
+        # All qualifying games (up to 15 — widest window needed)
+        log_qual = log[log["MIN"] >= MIN_MINUTES_THRESHOLD].head(15)
+        if log_qual.empty:
             continue
 
-        stat_series = log_filtered[stat_col].dropna()
+        stat_series = log_qual[stat_col].dropna()
         if stat_series.empty:
             continue
 
-        rolling_avg = round(float(stat_series.mean()), 2)
-        rolling_std = round(float(stat_series.std()), 2) if len(stat_series) > 1 else 0.0
-        hr = round(float((stat_series >= pp_line).mean()), 3)
+        # ── Primary window (variance-aware) ──────────────────────────────────
+        primary = stat_series.iloc[:form_window]
+        if primary.empty:
+            continue
+
+        rolling_avg = round(float(primary.mean()), 2)
+        rolling_std = round(float(primary.std()), 2) if len(primary) > 1 else 0.0
+        hr          = round(float((primary >= pp_line).mean()), 3)
 
         df.at[idx, "rolling_stat_avg"] = rolling_avg
         df.at[idx, "rolling_stat_std"] = rolling_std
         df.at[idx, "stat_hit_rate"]    = hr
-        df.at[idx, "avg_minutes"]      = round(float(log_filtered["MIN"].mean()), 1)
-        df.at[idx, "games_sampled"]    = len(log_filtered)
+        df.at[idx, "avg_minutes"]      = round(float(log_qual["MIN"].mean()), 1)
+        df.at[idx, "games_sampled"]    = len(primary)
 
-        # Legacy RA columns
+        # ── L5 / L10 / L15 windows ───────────────────────────────────────────
+        l5_avg,  l5_hr  = _window_stats(stat_series, pp_line, 5)
+        l10_avg, l10_hr = _window_stats(stat_series, pp_line, 10)
+        l15_avg, l15_hr = _window_stats(stat_series, pp_line, 15)
+
+        df.at[idx, "l5_avg"]      = l5_avg
+        df.at[idx, "l5_hit_rate"] = l5_hr
+        df.at[idx, "l10_avg"]     = l10_avg
+        df.at[idx, "l10_hit_rate"]= l10_hr
+        df.at[idx, "l15_avg"]     = l15_avg
+        df.at[idx, "l15_hit_rate"]= l15_hr
+
+        # ── Trend ─────────────────────────────────────────────────────────────
+        direction, t_pct = _compute_trend(l5_avg, l10_avg, l15_avg)
+        df.at[idx, "trend_direction"] = direction
+        df.at[idx, "trend_pct"]       = t_pct
+
+        # Valid trend: L5 avg must clear the PP line AND L5 hit rate >= 60%
+        # This prevents trusting a "hot trend" that is still below the line
+        trend_valid = (
+            l5_avg is not None
+            and l5_hr is not None
+            and l5_avg >= pp_line
+            and l5_hr >= 0.60
+        )
+        df.at[idx, "trend_is_valid"] = trend_valid
+
+        # ── Legacy RA columns ─────────────────────────────────────────────────
         if stat_cat == "Rebs+Asts":
             df.at[idx, "rolling_ra_avg"] = rolling_avg
             df.at[idx, "rolling_ra_std"] = rolling_std
             df.at[idx, "hit_rate"]        = hr
 
-        # Per-stat display columns
+        # ── Per-stat display columns ──────────────────────────────────────────
         col_map = {
             "Points":   "rolling_pts_avg",
             "Rebounds": "rolling_reb_avg",
@@ -379,15 +470,17 @@ def compute_player_form_multi(
         if stat_cat in col_map:
             df.at[idx, col_map[stat_cat]] = rolling_avg
 
-        # 3PT% for hot streak detection
-        if stat_cat == "3PM" and "FG3M" in log_filtered.columns and "FG3A" in log_filtered.columns:
-            total_3pm = log_filtered["FG3M"].sum()
-            total_3pa = log_filtered["FG3A"].sum()
+        # ── 3PT% hot streak ───────────────────────────────────────────────────
+        if stat_cat == "3PM" and "FG3M" in log_qual.columns and "FG3A" in log_qual.columns:
+            total_3pm = log_qual["FG3M"].sum()
+            total_3pa = log_qual["FG3A"].sum()
             if total_3pa > 0:
                 df.at[idx, "recent_3pt_pct"] = round(float(total_3pm / total_3pa), 3)
 
     numeric_cols = [
         "rolling_stat_avg", "rolling_stat_std", "stat_hit_rate", "avg_minutes",
+        "l5_avg", "l5_hit_rate", "l10_avg", "l10_hit_rate", "l15_avg", "l15_hit_rate",
+        "trend_pct",
         "rolling_ra_avg", "rolling_ra_std", "hit_rate",
         "rolling_pts_avg", "rolling_reb_avg", "rolling_ast_avg",
         "rolling_3pm_avg", "recent_3pt_pct",

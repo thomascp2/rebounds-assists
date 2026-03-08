@@ -11,6 +11,8 @@ import logging
 import pandas as pd
 
 from config import (
+    # Trend
+    TREND_UP_THRESHOLD, TREND_DOWN_THRESHOLD, TREND_BONUS, TREND_PENALTY,
     # Shared
     SCORE_WEIGHTS, QUALIFY_SCORE_MIN, DEMON_QUALIFY_SCORE_MIN,
     PACE_THRESHOLD, PACE_BOOST_THRESHOLD,
@@ -142,6 +144,40 @@ def _shared_form(row, components, edge_parts, weights, avg_col="rolling_stat_avg
             components["form_hit_rate_60"] = w
             score += w
             edge_parts.append(f"hit rate {hit_rate:.0%}")
+    return score
+
+
+def _apply_trend(row, components, edge_parts) -> float:
+    """
+    Applies trend bonus or penalty based on L5 vs L15 performance.
+
+    Bonus (+10):  valid uptrend — L5 >= 15% above L15, AND L5 avg >= PP line,
+                  AND L5 hit rate >= 60% (trend_is_valid gate prevents trusting
+                  a rising trend that is still below the line).
+
+    Penalty (-15): confirmed downtrend — L5 >= 15% below L15.
+                   Applied unconditionally — a declining player is a declining
+                   player regardless of their longer-term average.
+    """
+    trend_pct   = _sf(row.get("trend_pct"))
+    trend_dir   = str(row.get("trend_direction") or "unknown")
+    trend_valid = bool(row.get("trend_is_valid", False))
+
+    if trend_pct is None:
+        return 0.0
+
+    score = 0.0
+
+    if trend_pct >= TREND_UP_THRESHOLD and trend_valid:
+        components["trend_up"] = TREND_BONUS
+        score += TREND_BONUS
+        edge_parts.append(f"📈 trending up {trend_pct:+.0%} (L5 vs L15)")
+
+    elif trend_pct <= TREND_DOWN_THRESHOLD:
+        components["trend_down"] = TREND_PENALTY
+        score += TREND_PENALTY
+        edge_parts.append(f"📉 trending down {trend_pct:+.0%} (L5 vs L15)")
+
     return score
 
 
@@ -334,6 +370,9 @@ def score_row(row: pd.Series) -> dict | None:
     raw_score  = scoring_fn(row, components, edge_parts)
     weights    = _WEIGHTS_BY_STAT.get(stat_cat, SCORE_WEIGHTS)
 
+    # Trend bonus/penalty (applied before demon bonus so downtrends can block qualification)
+    raw_score += _apply_trend(row, components, edge_parts)
+
     # Demon bonus (only when base score already qualifies)
     final_score = _apply_demon_bonus(raw_score, is_demon, components, edge_parts, weights)
 
@@ -390,6 +429,16 @@ def score_row(row: pd.Series) -> dict | None:
         "stat_hit_rate":     hit_rate,
         "avg_minutes":       _sf(row.get("avg_minutes")),
         "games_sampled":     _si(row.get("games_sampled")),
+        # Multi-window trend
+        "l5_avg":            _sf(row.get("l5_avg")),
+        "l5_hit_rate":       _sf(row.get("l5_hit_rate")),
+        "l10_avg":           _sf(row.get("l10_avg")),
+        "l10_hit_rate":      _sf(row.get("l10_hit_rate")),
+        "l15_avg":           _sf(row.get("l15_avg")),
+        "l15_hit_rate":      _sf(row.get("l15_hit_rate")),
+        "trend_direction":   str(row.get("trend_direction") or "unknown"),
+        "trend_pct":         _sf(row.get("trend_pct")),
+        "trend_is_valid":    bool(row.get("trend_is_valid", False)),
         "recent_3pt_pct":    _sf(row.get("recent_3pt_pct")),
         "fg3a_per_game":     _sf(row.get("fg3a_per_game")),
         "usg_pct":           _sf(row.get("usg_pct")),

@@ -117,6 +117,28 @@ def print_console_report(scored_df: pd.DataFrame, top_n: int = TOP_N_DISPLAY) ->
         print(f"       Books Line:   {cons_s}  (gap vs PP: {gap_s})")
         print(f"       Last {games_s}g Avg:  {avg_s}  (±{std_s})  Mins: {mins_s}")
 
+        # Trend block — only show when we have multi-window data
+        l5_avg  = row.get("l5_avg")
+        l10_avg = row.get("l10_avg")
+        l15_avg = row.get("l15_avg")
+        if any(v is not None and not (isinstance(v, float) and pd.isna(v))
+               for v in [l5_avg, l10_avg, l15_avg]):
+            l5_s   = _fmt(l5_avg)
+            l10_s  = _fmt(l10_avg)
+            l15_s  = _fmt(l15_avg)
+            l5_hr  = _fmt(row.get("l5_hit_rate"),  ".0%")
+            l10_hr = _fmt(row.get("l10_hit_rate"), ".0%")
+            l15_hr = _fmt(row.get("l15_hit_rate"), ".0%")
+            t_dir  = str(row.get("trend_direction") or "unknown")
+            t_pct  = row.get("trend_pct")
+            t_pct_s = _fmt(t_pct, "+.0%") if t_pct is not None else "N/A"
+            t_icon = {"up": "📈", "down": "📉", "flat": "➡️", "mixed": "〰️"}.get(t_dir, "")
+            valid_tag = " ✅" if row.get("trend_is_valid") else ""
+            print(f"       Trend:        {t_icon} {t_dir.upper()} {t_pct_s}{valid_tag}")
+            print(f"       L5:  avg {l5_s}  HR {l5_hr}  |  "
+                  f"L10: avg {l10_s}  HR {l10_hr}  |  "
+                  f"L15: avg {l15_s}  HR {l15_hr}")
+
         # Category-specific feature lines
         if cat == "Rebs+Asts" or cat == "Rebounds":
             reb_rank = _fmt(row.get("opp_reb_rank"), fmt="d")

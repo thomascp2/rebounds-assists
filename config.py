@@ -227,6 +227,13 @@ SCORE_WEIGHTS_3PM = {
     "demon_bonus":         20,
 }
 
+# ── Trend Detection ───────────────────────────────────────────────────────────
+# trend_pct = (L5_avg - L15_avg) / L15_avg
+TREND_UP_THRESHOLD   =  0.15   # L5 >= 15% above L15 → confirmed uptrend
+TREND_DOWN_THRESHOLD = -0.15   # L5 >= 15% below L15 → confirmed downtrend
+TREND_BONUS          =  10     # score bonus for confirmed valid uptrend
+TREND_PENALTY        = -15     # score penalty for confirmed downtrend (applies regardless of validity check)
+
 # ── Qualify Thresholds ────────────────────────────────────────────────────────
 QUALIFY_SCORE_MIN      = 40
 DEMON_QUALIFY_SCORE_MIN = 35
