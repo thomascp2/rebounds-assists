@@ -44,6 +44,7 @@ def run_pipeline():
     from features.engineer import build_feature_dataframe
     from model.scorer import score_all
     from output.report import generate_report
+    from output.lineup_builder import generate_lineups
     from config import FORM_WINDOW_BY_VARIANCE, VARIANCE_TIER
 
     logger.info("=" * 60)
@@ -181,8 +182,9 @@ def run_pipeline():
         sys.exit(1)
 
     # ── Step 6: Output ────────────────────────────────────────────────────────
-    logger.info("[6/6] Generating report...")
+    logger.info("[6/6] Generating report and lineups...")
     generate_report(scored_df)
+    generate_lineups(scored_df)
 
     logger.info("Pipeline complete.")
     return scored_df
