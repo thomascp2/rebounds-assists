@@ -24,9 +24,8 @@ from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from fuzzywuzzy import fuzz
 
-# Discord webhook URL
-DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL',
-    "https://discord.com/api/webhooks/1435509138687004672/YSOXw9z6gtGj9wSRAABiGLa-7P2eBhFgPRoAQp1vdV5f2_5YCmy1fYkj2EQpb-XIPnBQ")
+# Discord webhook URL — set via environment variable or .env file, never hardcode
+DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', "")
 
 
 @dataclass
