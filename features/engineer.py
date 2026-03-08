@@ -1,16 +1,6 @@
 """
-features/engineer.py — Merges all data sources and engineers scoring features.
-
-Input DataFrames (from data layer):
-  - pp_board:       PrizePicks Rebs+Asts props (from prizepicks.py)
-  - team_pace:      Team pace per game (from nba_stats.py)
-  - opp_rebounding: Opponent rebounding rank (from nba_stats.py)
-  - player_logs:    Dict of {player_id: game_log_df} (from nba_stats.py)
-  - consensus_lines: Sportsbook consensus over lines (from odds_api.py)
-  - active_players: Player name → ID mapping (from nba_stats.py)
-
-Output:
-  - A merged DataFrame ready for the scorer with all features pre-computed.
+features/engineer.py — Merges all data sources and engineers scoring features
+for all 5 stat categories: Rebs+Asts, Points, Rebounds, Assists, 3PM.
 """
 
 import logging
@@ -19,21 +9,23 @@ from difflib import get_close_matches
 
 import pandas as pd
 
-from config import FORM_WINDOW, MIN_MINUTES_THRESHOLD
+from config import (
+    FORM_WINDOW,
+    MIN_MINUTES_THRESHOLD,
+    VARIANCE_TIER,
+    FORM_WINDOW_BY_VARIANCE,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ── Name Matching ─────────────────────────────────────────────────────────────
+# ── Name Normalization ────────────────────────────────────────────────────────
 
 _NAME_SUFFIXES = {" jr", " sr", " ii", " iii", " iv", " v"}
 
 
 def _ascii_fold(name: str) -> str:
-    """
-    Normalize Unicode diacritics to plain ASCII.
-    e.g. 'Luka Dončić' → 'luka doncic', 'Nikola Jokić' → 'nikola jokic'
-    """
+    """Normalize Unicode diacritics to plain ASCII (Dončić → doncic)."""
     return (
         unicodedata.normalize("NFKD", name)
         .encode("ascii", "ignore")
@@ -44,7 +36,6 @@ def _ascii_fold(name: str) -> str:
 
 
 def _strip_suffix(name: str) -> str:
-    """Remove generational suffixes so 'Trey Murphy' matches 'Trey Murphy III'."""
     for suffix in _NAME_SUFFIXES:
         if name.endswith(suffix):
             return name[: -len(suffix)].strip()
@@ -52,51 +43,33 @@ def _strip_suffix(name: str) -> str:
 
 
 def _build_name_lookup(active_players: pd.DataFrame) -> dict[str, int]:
-    """
-    Builds a dict of {normalized_name: PERSON_ID} for fuzzy matching.
-    Stores the original lowercase name, the ASCII-folded version, and
-    suffix-stripped variants so any combination can match.
-    """
     lookup = {}
     for _, row in active_players.iterrows():
         raw = str(row.get("DISPLAY_FIRST_LAST", "")).strip()
         pid = int(row["PERSON_ID"])
         if not raw:
             continue
-
         for variant in {raw.lower(), _ascii_fold(raw)}:
             lookup[variant] = pid
             stripped = _strip_suffix(variant)
             if stripped != variant:
                 lookup[stripped] = pid
-
     return lookup
 
 
 def _match_player_name(pp_name: str, lookup: dict[str, int]) -> int | None:
-    """
-    Attempts exact match → ASCII-folded match → suffix-stripped match → fuzzy match.
-    Returns the PERSON_ID or None if not found.
-    """
     normalized = pp_name.strip().lower()
     folded = _ascii_fold(pp_name)
 
-    # 1. Exact lowercase match
     if normalized in lookup:
         return lookup[normalized]
-
-    # 2. ASCII-folded match (handles diacritics: Dončić → doncic)
     if folded in lookup:
         logger.debug("ASCII-folded match '%s' → '%s'", pp_name, folded)
         return lookup[folded]
-
-    # 3. Suffix-stripped variants
     for candidate in {_strip_suffix(normalized), _strip_suffix(folded)}:
         if candidate in lookup:
             logger.debug("Suffix-stripped match '%s' → '%s'", pp_name, candidate)
             return lookup[candidate]
-
-    # 4. Fuzzy fallback against all keys (includes folded + stripped variants)
     matches = get_close_matches(folded, lookup.keys(), n=1, cutoff=0.82)
     if matches:
         logger.debug("Fuzzy matched '%s' → '%s'", pp_name, matches[0])
@@ -106,40 +79,65 @@ def _match_player_name(pp_name: str, lookup: dict[str, int]) -> int | None:
     return None
 
 
-# ── Game Pace for Today's Matchups ────────────────────────────────────────────
+# ── Stat Category Normalization ───────────────────────────────────────────────
 
-def compute_game_pace(
-    pp_board: pd.DataFrame,
-    team_pace: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    For each prop on the PrizePicks board, looks up both teams' pace and
-    computes projected_game_pace = average of the two teams' season pace.
+_STAT_CATEGORY_MAP = {
+    "reboundsassists":    "Rebs+Asts",
+    "rebsasts":           "Rebs+Asts",
+    "ra":                 "Rebs+Asts",
+    "reboundsplusassists":"Rebs+Asts",
+    "points":             "Points",
+    "pts":                "Points",
+    "rebounds":           "Rebounds",
+    "reb":                "Rebounds",
+    "assists":            "Assists",
+    "ast":                "Assists",
+    "3pointsmade":        "3PM",
+    "3pm":                "3PM",
+    "3pointersmade":      "3PM",
+    "threepointersmade":  "3PM",
+    "threes":             "3PM",
+}
 
-    Adds columns to pp_board:
-        player_team_pace, opp_team_pace, projected_game_pace
-    """
+# Game-log column for each stat category
+_STAT_LOG_COL = {
+    "Rebs+Asts": "RA",
+    "Points":    "PTS",
+    "Rebounds":  "REB",
+    "Assists":   "AST",
+    "3PM":       "FG3M",
+}
+
+
+def _normalize_stat_category(stat_type: str) -> str:
+    key = (
+        stat_type.lower()
+        .replace(" ", "")
+        .replace("+", "")
+        .replace("-", "")
+    )
+    return _STAT_CATEGORY_MAP.get(key, stat_type)
+
+
+# ── Game Pace ─────────────────────────────────────────────────────────────────
+
+def compute_game_pace(pp_board: pd.DataFrame, team_pace: pd.DataFrame) -> pd.DataFrame:
     pace_map = {}
     if not team_pace.empty and "TEAM_NAME" in team_pace.columns:
-        pace_map = dict(zip(
-            team_pace["TEAM_NAME"].str.upper(),
-            team_pace["PACE"],
-        ))
-    # Also map by abbreviation if available
+        pace_map = dict(zip(team_pace["TEAM_NAME"].str.upper(), team_pace["PACE"]))
     if not team_pace.empty and "TEAM_ABBREVIATION" in team_pace.columns:
         for _, row in team_pace.iterrows():
             pace_map[str(row["TEAM_ABBREVIATION"]).upper()] = row["PACE"]
 
-    def _lookup_pace(team_str: str) -> float | None:
-        key = str(team_str).strip().upper()
-        return pace_map.get(key)
+    def _lookup(team_str):
+        return pace_map.get(str(team_str).strip().upper())
 
     df = pp_board.copy()
-    df["player_team_pace"] = df["team"].apply(_lookup_pace)
+    df["player_team_pace"] = df["team"].apply(_lookup)
     df["opp_team_pace"] = df.apply(
-        lambda r: _lookup_pace(r["away_team"])
+        lambda r: _lookup(r["away_team"])
         if r["team"].upper() == r["home_team"].upper()
-        else _lookup_pace(r["home_team"]),
+        else _lookup(r["home_team"]),
         axis=1,
     )
     df["projected_game_pace"] = (
@@ -148,207 +146,324 @@ def compute_game_pace(
     return df
 
 
-# ── Opponent Rebounding ───────────────────────────────────────────────────────
+# ── Opponent Helper ───────────────────────────────────────────────────────────
 
-def attach_opponent_rebounding(
+def _build_opp_map(opp_df: pd.DataFrame, val_cols: list[str]) -> dict:
+    """Build {TEAM_KEY: (val1, val2, ...)} lookup from a team stats DataFrame."""
+    opp_map = {}
+    for name_col in ("TEAM_NAME", "TEAM_ABBREVIATION"):
+        if name_col not in opp_df.columns:
+            continue
+        for _, row in opp_df.iterrows():
+            key = str(row[name_col]).strip().upper()
+            opp_map[key] = tuple(row.get(c) for c in val_cols)
+    return opp_map
+
+
+def _get_opp_team(row) -> str:
+    player_team = str(row.get("team", "")).strip().upper()
+    home = str(row.get("home_team", "")).strip().upper()
+    away = str(row.get("away_team", "")).strip().upper()
+    return away if player_team == home else home
+
+
+def _attach_opp_columns(
     df: pd.DataFrame,
-    opp_rebounding: pd.DataFrame,
+    opp_map: dict,
+    val_cols: list[str],
+    out_cols: list[str],
 ) -> pd.DataFrame:
-    """
-    Attaches OPP_REB and OPP_REB_RANK to each row based on the opposing team.
-    The "opponent" for a given player is the other team in the game_label.
-    """
-    reb_map_name = {}
-    if not opp_rebounding.empty and "TEAM_NAME" in opp_rebounding.columns:
-        reb_map_name = dict(zip(
-            opp_rebounding["TEAM_NAME"].str.upper(),
-            zip(opp_rebounding["OPP_REB"], opp_rebounding["OPP_REB_RANK"]),
-        ))
-    if not opp_rebounding.empty and "TEAM_ABBREVIATION" in opp_rebounding.columns:
-        for _, row in opp_rebounding.iterrows():
-            reb_map_name[str(row["TEAM_ABBREVIATION"]).upper()] = (
-                row["OPP_REB"], row["OPP_REB_RANK"]
-            )
-
-    def _get_opp_team(row) -> str:
-        """The team the player is playing AGAINST."""
-        player_team = str(row["team"]).strip().upper()
-        home = str(row["home_team"]).strip().upper()
-        away = str(row["away_team"]).strip().upper()
-        if player_team == home:
-            return away
-        return home
-
-    def _lookup_reb(row):
-        opp = _get_opp_team(row)
-        return reb_map_name.get(opp, (None, None))
-
+    """Generic helper: attach opponent stats by opposing team lookup."""
     df = df.copy()
-    df["opponent_team"] = df.apply(_get_opp_team, axis=1)
-    reb_info = df.apply(_lookup_reb, axis=1)
-    df["opp_reb_allowed"] = reb_info.apply(lambda x: x[0])
-    df["opp_reb_rank"] = reb_info.apply(lambda x: x[1])
+    info = df.apply(
+        lambda r: opp_map.get(_get_opp_team(r), tuple(None for _ in val_cols)),
+        axis=1,
+    )
+    for i, col in enumerate(out_cols):
+        df[col] = info.apply(lambda x: x[i])
     return df
 
 
-# ── Rolling Form Stats ────────────────────────────────────────────────────────
+# ── Opponent Rebounding ───────────────────────────────────────────────────────
 
-def compute_player_form(
-    df: pd.DataFrame,
-    player_logs: dict[int, pd.DataFrame],
-    name_lookup: dict[str, int],
-    form_window: int = FORM_WINDOW,
-) -> pd.DataFrame:
-    """
-    For each player, computes rolling stats over the last `form_window` games:
-        rolling_ra_avg     — average Rebs+Asts over last N games
-        rolling_ra_std     — standard deviation (consistency signal)
-        hit_rate           — fraction of games where RA >= PP line
-        avg_minutes        — average minutes played
-        games_sampled      — how many games were in the window
-
-    Adds these as columns to df.
-    """
-    df = df.copy()
-
-    form_cols = ["rolling_ra_avg", "rolling_ra_std", "hit_rate", "avg_minutes", "games_sampled"]
-    for col in form_cols:
-        df[col] = None
-
-    for idx, row in df.iterrows():
-        pp_name = row["player_name"]
-        pp_line = row["line"]
-
-        # Resolve player ID — from PrizePicks payload or name matching
-        pid = row.get("nba_player_id")
-        if pid is None or pd.isna(pid):
-            pid = _match_player_name(pp_name, name_lookup)
-
-        if pid is None:
-            continue
-
-        log = player_logs.get(int(pid), pd.DataFrame())
-        if log.empty:
-            continue
-
-        # Filter to minimum minutes (exclude DNPs skewing the average)
-        log_filtered = log[log["MIN"] >= MIN_MINUTES_THRESHOLD].head(form_window)
-        if log_filtered.empty:
-            continue
-
-        ra_series = log_filtered["RA"]
-        df.at[idx, "rolling_ra_avg"] = round(ra_series.mean(), 2)
-        df.at[idx, "rolling_ra_std"] = round(ra_series.std(), 2)
-        df.at[idx, "hit_rate"] = round((ra_series >= pp_line).mean(), 3)
-        df.at[idx, "avg_minutes"] = round(log_filtered["MIN"].mean(), 1)
-        df.at[idx, "games_sampled"] = len(log_filtered)
-
-    for col in ["rolling_ra_avg", "rolling_ra_std", "hit_rate", "avg_minutes"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["games_sampled"] = pd.to_numeric(df["games_sampled"], errors="coerce").astype("Int64")
-
+def attach_opponent_rebounding(df: pd.DataFrame, opponent_stats: pd.DataFrame) -> pd.DataFrame:
+    """Attaches opp_reb_allowed and opp_reb_rank to each row."""
+    opp_map = _build_opp_map(opponent_stats, ["OPP_REB", "OPP_REB_RANK"])
+    df = _attach_opp_columns(df, opp_map, ["OPP_REB", "OPP_REB_RANK"],
+                              ["opp_reb_allowed", "opp_reb_rank"])
+    df["opponent_team"] = df.apply(_get_opp_team, axis=1)
     return df
 
 
 # ── Opponent Shooting % ───────────────────────────────────────────────────────
 
-def attach_opponent_shooting(
-    df: pd.DataFrame,
-    team_shooting: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Attaches the opposing team's offensive FG% to each row.
-
-    Low opponent FG% = they miss more shots = more defensive rebound opportunities
-    for our player.  Columns added:
-        opp_fg_pct      — opposing team's season FG%
-        opp_fg_pct_rank — 1=best shooters (few misses), 30=worst (most misses)
-    """
+def attach_opponent_shooting(df: pd.DataFrame, team_shooting: pd.DataFrame) -> pd.DataFrame:
+    """Attaches opp_fg_pct and opp_fg_pct_rank to each row."""
     shooting_map = {}
-    if not team_shooting.empty and "TEAM_NAME" in team_shooting.columns:
-        for _, row in team_shooting.iterrows():
-            key = str(row["TEAM_NAME"]).strip().upper()
-            shooting_map[key] = (row["FG_PCT"], row["FG_PCT_RANK"])
-    if not team_shooting.empty and "TEAM_ABBREVIATION" in team_shooting.columns:
-        for _, row in team_shooting.iterrows():
-            key = str(row["TEAM_ABBREVIATION"]).strip().upper()
-            shooting_map[key] = (row["FG_PCT"], row["FG_PCT_RANK"])
+    if not team_shooting.empty:
+        for name_col in ("TEAM_NAME", "TEAM_ABBREVIATION"):
+            if name_col not in team_shooting.columns:
+                continue
+            for _, row in team_shooting.iterrows():
+                key = str(row[name_col]).strip().upper()
+                shooting_map[key] = (row.get("FG_PCT"), row.get("FG_PCT_RANK"))
 
-    def _get_opp_team(row) -> str:
-        player_team = str(row["team"]).strip().upper()
-        home = str(row.get("home_team", "")).strip().upper()
-        away = str(row.get("away_team", "")).strip().upper()
-        return away if player_team == home else home
-
-    def _lookup_shooting(row):
-        opp = _get_opp_team(row)
-        return shooting_map.get(opp, (None, None))
-
-    df = df.copy()
-    shooting_info = df.apply(_lookup_shooting, axis=1)
-    df["opp_fg_pct"] = shooting_info.apply(lambda x: x[0])
-    df["opp_fg_pct_rank"] = shooting_info.apply(lambda x: x[1])
+    df = _attach_opp_columns(df, shooting_map, ["FG_PCT", "FG_PCT_RANK"],
+                              ["opp_fg_pct", "opp_fg_pct_rank"])
     df["opp_fg_pct"] = pd.to_numeric(df["opp_fg_pct"], errors="coerce")
     return df
 
 
-# ── Line Gap (PrizePicks vs. Books) ───────────────────────────────────────────
+# ── Opponent Defense (Points allowed) ────────────────────────────────────────
 
-def attach_line_gap(df: pd.DataFrame, consensus_lines: pd.DataFrame) -> pd.DataFrame:
-    """
-    Joins PrizePicks lines to sportsbook consensus lines and computes:
-        consensus_line  — median sportsbook over line
-        line_gap        — PP line minus consensus_line (positive = PP is higher = easier to beat)
-        num_books       — number of books with this prop
+def attach_opponent_defense(df: pd.DataFrame, opponent_stats: pd.DataFrame) -> pd.DataFrame:
+    """Attaches opp_pts_allowed and opp_def_rank to each row (for Points props)."""
+    opp_map = _build_opp_map(opponent_stats, ["OPP_PTS", "OPP_PTS_RANK"])
+    df = _attach_opp_columns(df, opp_map, ["OPP_PTS", "OPP_PTS_RANK"],
+                              ["opp_pts_allowed", "opp_def_rank"])
+    df["opp_pts_allowed"] = pd.to_numeric(df["opp_pts_allowed"], errors="coerce")
+    return df
 
-    A positive line_gap means PrizePicks has set a LOWER line than the books,
-    so the over is relatively easier to hit on PrizePicks.
-    Wait — let's be precise: PrizePicks shows the projection you must beat.
-    If PP line = 14.5 and books' over line = 16.5, books think 14.5 is easy.
-    So line_gap = consensus - PP_line → positive gap = PP is EASIER than books.
-    """
-    if consensus_lines.empty:
-        df["consensus_line"] = None
-        df["line_gap"] = None
-        df["num_books"] = None
+
+# ── Opponent 3PT Defense ──────────────────────────────────────────────────────
+
+def attach_opponent_3pt_defense(df: pd.DataFrame, opponent_stats: pd.DataFrame) -> pd.DataFrame:
+    """Attaches opp_3pa_allowed, opp_3pa_rank, opp_3pt_pct_allowed, opp_3pt_pct_rank."""
+    opp_map = _build_opp_map(
+        opponent_stats,
+        ["OPP_FG3A", "OPP_FG3A_RANK", "OPP_FG3_PCT", "OPP_FG3_PCT_RANK"],
+    )
+    df = _attach_opp_columns(
+        df, opp_map,
+        ["OPP_FG3A", "OPP_FG3A_RANK", "OPP_FG3_PCT", "OPP_FG3_PCT_RANK"],
+        ["opp_3pa_allowed", "opp_3pa_rank", "opp_3pt_pct_allowed", "opp_3pt_pct_rank"],
+    )
+    for col in ["opp_3pa_allowed", "opp_3pt_pct_allowed"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+# ── Opponent Assist Context ───────────────────────────────────────────────────
+
+def attach_opponent_assist_context(df: pd.DataFrame, opponent_stats: pd.DataFrame) -> pd.DataFrame:
+    """Attaches opp_ast_allowed and opp_ast_rank to each row (for Assists props)."""
+    opp_map = _build_opp_map(opponent_stats, ["OPP_AST", "OPP_AST_RANK"])
+    df = _attach_opp_columns(df, opp_map, ["OPP_AST", "OPP_AST_RANK"],
+                              ["opp_ast_allowed", "opp_ast_rank"])
+    df["opp_ast_allowed"] = pd.to_numeric(df["opp_ast_allowed"], errors="coerce")
+    return df
+
+
+# ── Player Advanced Stats ─────────────────────────────────────────────────────
+
+def attach_player_advanced_stats(
+    df: pd.DataFrame,
+    player_advanced: pd.DataFrame,
+    name_lookup: dict[str, int],
+) -> pd.DataFrame:
+    """Attaches USG_PCT, REB_PCT, AST_PCT, FG3A_PER_GAME per player."""
+    adv_cols = ["usg_pct", "reb_pct", "ast_pct", "fg3a_per_game"]
+    df = df.copy()
+    for col in adv_cols:
+        df[col] = None
+
+    if player_advanced is None or player_advanced.empty:
         return df
 
-    # Normalize names for matching
-    consensus_lines = consensus_lines.copy()
-    consensus_lines["player_name_norm"] = (
-        consensus_lines["player_name"].str.strip().str.lower()
-    )
+    adv_map = {}
+    for _, row in player_advanced.iterrows():
+        pid = int(row["PLAYER_ID"])
+        adv_map[pid] = {
+            "usg_pct":       row.get("USG_PCT"),
+            "reb_pct":       row.get("REB_PCT"),
+            "ast_pct":       row.get("AST_PCT"),
+            "fg3a_per_game": row.get("FG3A_PER_GAME"),
+        }
+
+    for idx, row in df.iterrows():
+        pid = row.get("nba_player_id")
+        if pid is None or pd.isna(pid):
+            pid = _match_player_name(row["player_name"], name_lookup)
+        if pid is None:
+            continue
+        stats = adv_map.get(int(pid), {})
+        for col in adv_cols:
+            df.at[idx, col] = stats.get(col)
+
+    for col in adv_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+# ── Multi-stat Rolling Form ───────────────────────────────────────────────────
+
+def compute_player_form_multi(
+    df: pd.DataFrame,
+    player_logs: dict[int, pd.DataFrame],
+    name_lookup: dict[str, int],
+) -> pd.DataFrame:
+    """
+    Computes rolling form stats for every prop using a variance-aware window.
+
+    Generic output columns (used by scorer for all stat categories):
+        rolling_stat_avg, rolling_stat_std, stat_hit_rate, avg_minutes, games_sampled
+
+    Legacy Rebs+Asts columns (backwards compat):
+        rolling_ra_avg, rolling_ra_std, hit_rate
+
+    Additional per-stat averages for display:
+        rolling_pts_avg, rolling_reb_avg, rolling_ast_avg, rolling_3pm_avg, recent_3pt_pct
+    """
+    df = df.copy()
+
+    all_new_cols = [
+        "rolling_stat_avg", "rolling_stat_std", "stat_hit_rate",
+        "avg_minutes", "games_sampled",
+        "rolling_ra_avg", "rolling_ra_std", "hit_rate",
+        "rolling_pts_avg", "rolling_reb_avg", "rolling_ast_avg",
+        "rolling_3pm_avg", "recent_3pt_pct",
+    ]
+    for col in all_new_cols:
+        df[col] = None
+
+    for idx, row in df.iterrows():
+        pp_name = row["player_name"]
+        pp_line = row["line"]
+        stat_cat = row.get("stat_category", "Rebs+Asts")
+
+        variance = VARIANCE_TIER.get(stat_cat, "medium")
+        form_window = FORM_WINDOW_BY_VARIANCE.get(variance, 10)
+        stat_col = _STAT_LOG_COL.get(stat_cat, "RA")
+
+        pid = row.get("nba_player_id")
+        if pid is None or pd.isna(pid):
+            pid = _match_player_name(pp_name, name_lookup)
+        if pid is None:
+            continue
+
+        log = player_logs.get(int(pid), pd.DataFrame())
+        if log.empty or stat_col not in log.columns:
+            continue
+
+        log_filtered = log[log["MIN"] >= MIN_MINUTES_THRESHOLD].head(form_window)
+        if log_filtered.empty:
+            continue
+
+        stat_series = log_filtered[stat_col].dropna()
+        if stat_series.empty:
+            continue
+
+        rolling_avg = round(float(stat_series.mean()), 2)
+        rolling_std = round(float(stat_series.std()), 2) if len(stat_series) > 1 else 0.0
+        hr = round(float((stat_series >= pp_line).mean()), 3)
+
+        df.at[idx, "rolling_stat_avg"] = rolling_avg
+        df.at[idx, "rolling_stat_std"] = rolling_std
+        df.at[idx, "stat_hit_rate"]    = hr
+        df.at[idx, "avg_minutes"]      = round(float(log_filtered["MIN"].mean()), 1)
+        df.at[idx, "games_sampled"]    = len(log_filtered)
+
+        # Legacy RA columns
+        if stat_cat == "Rebs+Asts":
+            df.at[idx, "rolling_ra_avg"] = rolling_avg
+            df.at[idx, "rolling_ra_std"] = rolling_std
+            df.at[idx, "hit_rate"]        = hr
+
+        # Per-stat display columns
+        col_map = {
+            "Points":   "rolling_pts_avg",
+            "Rebounds": "rolling_reb_avg",
+            "Assists":  "rolling_ast_avg",
+            "3PM":      "rolling_3pm_avg",
+        }
+        if stat_cat in col_map:
+            df.at[idx, col_map[stat_cat]] = rolling_avg
+
+        # 3PT% for hot streak detection
+        if stat_cat == "3PM" and "FG3M" in log_filtered.columns and "FG3A" in log_filtered.columns:
+            total_3pm = log_filtered["FG3M"].sum()
+            total_3pa = log_filtered["FG3A"].sum()
+            if total_3pa > 0:
+                df.at[idx, "recent_3pt_pct"] = round(float(total_3pm / total_3pa), 3)
+
+    numeric_cols = [
+        "rolling_stat_avg", "rolling_stat_std", "stat_hit_rate", "avg_minutes",
+        "rolling_ra_avg", "rolling_ra_std", "hit_rate",
+        "rolling_pts_avg", "rolling_reb_avg", "rolling_ast_avg",
+        "rolling_3pm_avg", "recent_3pt_pct",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["games_sampled"] = pd.to_numeric(df["games_sampled"], errors="coerce").astype("Int64")
+    return df
+
+
+# ── Line Gap (multi-stat) ─────────────────────────────────────────────────────
+
+def attach_line_gap_multi(
+    df: pd.DataFrame,
+    all_consensus_lines: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Attaches consensus_line, line_gap, num_books per row.
+    Merges on (player_name_norm, stat_category) so each stat gets its own book line.
+    """
+    if all_consensus_lines.empty:
+        df["consensus_line"] = None
+        df["line_gap"]       = None
+        df["num_books"]      = None
+        return df
+
+    consensus = all_consensus_lines.copy()
+    consensus["player_name_norm"] = consensus["player_name"].apply(_ascii_fold)
 
     df = df.copy()
-    df["player_name_norm"] = df["player_name"].str.strip().str.lower()
+    df["player_name_norm"] = df["player_name"].apply(_ascii_fold)
 
     merged = df.merge(
-        consensus_lines[["player_name_norm", "consensus_line", "num_books", "books_listed"]],
-        on="player_name_norm",
+        consensus[["player_name_norm", "stat_category", "consensus_line", "num_books"]],
+        on=["player_name_norm", "stat_category"],
         how="left",
     )
-
-    # line_gap > 0 means books' over line is HIGHER than PP → PP line is easier
     merged["line_gap"] = merged["consensus_line"] - merged["line"]
     merged = merged.drop(columns=["player_name_norm"])
     return merged
 
 
-# ── Master Merge ──────────────────────────────────────────────────────────────
+# Legacy single-stat attach_line_gap (kept for backwards compat)
+def attach_line_gap(df: pd.DataFrame, consensus_lines: pd.DataFrame) -> pd.DataFrame:
+    if consensus_lines.empty:
+        df["consensus_line"] = None
+        df["line_gap"]       = None
+        df["num_books"]      = None
+        return df
+    consensus_lines = consensus_lines.copy()
+    consensus_lines["player_name_norm"] = consensus_lines["player_name"].apply(_ascii_fold)
+    df = df.copy()
+    df["player_name_norm"] = df["player_name"].apply(_ascii_fold)
+    merged = df.merge(
+        consensus_lines[["player_name_norm", "consensus_line", "num_books"]],
+        on="player_name_norm", how="left",
+    )
+    merged["line_gap"] = merged["consensus_line"] - merged["line"]
+    return merged.drop(columns=["player_name_norm"])
+
+
+# ── Master Build ──────────────────────────────────────────────────────────────
 
 def build_feature_dataframe(
     pp_board: pd.DataFrame,
     team_pace: pd.DataFrame,
-    opp_rebounding: pd.DataFrame,
+    opponent_stats: pd.DataFrame,
     team_shooting: pd.DataFrame,
     player_logs: dict[int, pd.DataFrame],
-    consensus_lines: pd.DataFrame,
+    all_consensus_lines: pd.DataFrame,
     active_players: pd.DataFrame,
-    form_window: int = FORM_WINDOW,
+    player_advanced_stats: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Orchestrates all feature engineering steps and returns a single
-    feature-complete DataFrame ready for the scorer.
+    Orchestrates all feature engineering steps for all stat categories.
+    Returns a feature-complete DataFrame ready for the multi-stat scorer.
     """
     if pp_board.empty:
         logger.error("PrizePicks board is empty — nothing to score.")
@@ -356,27 +471,46 @@ def build_feature_dataframe(
 
     logger.info("Building feature DataFrame for %d props...", len(pp_board))
 
-    # Build player name → ID lookup
     name_lookup = _build_name_lookup(active_players)
 
-    # Step 1: Game pace features
-    df = compute_game_pace(pp_board, team_pace)
+    # 0. Normalize stat_category
+    df = pp_board.copy()
+    df["stat_category"] = df["stat_type"].apply(_normalize_stat_category)
+
+    # 1. Game pace
+    df = compute_game_pace(df, team_pace)
     logger.info("✓ Game pace attached.")
 
-    # Step 2: Opponent rebounding features
-    df = attach_opponent_rebounding(df, opp_rebounding)
+    # 2. Opponent rebounding (used by Rebs+Asts and Rebounds)
+    df = attach_opponent_rebounding(df, opponent_stats)
     logger.info("✓ Opponent rebounding attached.")
 
-    # Step 3: Opponent shooting % (miss rate → rebound opportunities)
+    # 3. Opponent shooting % (used by Rebs+Asts and Rebounds)
     df = attach_opponent_shooting(df, team_shooting)
     logger.info("✓ Opponent shooting % attached.")
 
-    # Step 4: Line gap vs. sportsbooks
-    df = attach_line_gap(df, consensus_lines)
-    logger.info("✓ Sportsbook line gap attached.")
+    # 4. Opponent defense quality (used by Points)
+    df = attach_opponent_defense(df, opponent_stats)
+    logger.info("✓ Opponent defense quality attached.")
 
-    # Step 5: Player rolling form
-    df = compute_player_form(df, player_logs, name_lookup, form_window)
+    # 5. Opponent 3PT defense (used by 3PM)
+    df = attach_opponent_3pt_defense(df, opponent_stats)
+    logger.info("✓ Opponent 3PT defense attached.")
+
+    # 6. Opponent assist context (used by Assists)
+    df = attach_opponent_assist_context(df, opponent_stats)
+    logger.info("✓ Opponent assist context attached.")
+
+    # 7. Player advanced stats (optional — graceful if missing)
+    df = attach_player_advanced_stats(df, player_advanced_stats, name_lookup)
+    logger.info("✓ Player advanced stats attached.")
+
+    # 8. Sportsbook line gap (multi-stat)
+    df = attach_line_gap_multi(df, all_consensus_lines)
+    logger.info("✓ Sportsbook line gaps attached.")
+
+    # 9. Rolling form (variance-aware, all stat categories)
+    df = compute_player_form_multi(df, player_logs, name_lookup)
     logger.info("✓ Player rolling form attached.")
 
     return df.reset_index(drop=True)

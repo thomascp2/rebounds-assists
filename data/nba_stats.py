@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # nba_api imports
 from nba_api.stats.endpoints import (
     leaguedashteamstats,
+    leaguedashplayerstats,
     playergamelog,
     commonallplayers,
 )
@@ -134,13 +135,15 @@ def fetch_player_game_log(player_id: int, last_n_games: int = 15) -> pd.DataFram
     if df.empty:
         return df
 
-    for col in ["MIN", "REB", "AST"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["MIN", "PTS", "REB", "AST", "FG3M", "FG3A"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["RA"] = df["REB"] + df["AST"]
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], format="%b %d, %Y", errors="coerce")
 
-    cols = ["GAME_DATE", "MATCHUP", "MIN", "REB", "AST", "RA"]
+    want = ["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "FG3M", "FG3A", "RA"]
+    cols = [c for c in want if c in df.columns]
     return df[cols].head(last_n_games).reset_index(drop=True)
 
 
@@ -178,3 +181,108 @@ def fetch_active_players() -> pd.DataFrame:
     cols = ["PERSON_ID", "DISPLAY_FIRST_LAST", "TEAM_ID", "TEAM_ABBREVIATION"]
     available = [c for c in cols if c in df.columns]
     return df[available].copy()
+
+
+# ── Comprehensive Opponent Stats ───────────────────────────────────────────────
+
+def fetch_opponent_stats() -> pd.DataFrame:
+    """
+    Fetches all per-team opponent stats in a single API call using the
+    'Opponent' measure type. Returns columns useful across all 5 stat categories:
+
+        TEAM_ID, TEAM_NAME, TEAM_ABBREVIATION
+        OPP_PTS, OPP_PTS_RANK        — points allowed (rank 30 = worst D)
+        OPP_REB, OPP_REB_RANK        — rebounds allowed (rank 30 = most given up)
+        OPP_AST, OPP_AST_RANK        — assists allowed (rank 30 = most given up)
+        OPP_FG3A, OPP_FG3A_RANK     — 3PA allowed (rank 30 = most 3s given up)
+        OPP_FG3_PCT, OPP_FG3_PCT_RANK — 3PT% allowed (rank 30 = easiest 3s)
+        OPP_OREB, OPP_OREB_RANK     — opponent offensive rebounds (rank 30 = most)
+    """
+    logger.info("Fetching comprehensive opponent stats (Opponent measure)...")
+    time.sleep(0.6)
+    endpoint = leaguedashteamstats.LeagueDashTeamStats(
+        season=CURRENT_SEASON,
+        season_type_all_star=SEASON_TYPE,
+        measure_type_detailed_defense="Opponent",
+        per_mode_detailed="PerGame",
+    )
+    df = endpoint.get_data_frames()[0]
+
+    stat_cols = ["OPP_PTS", "OPP_REB", "OPP_AST", "OPP_FG3A", "OPP_FG3_PCT", "OPP_OREB"]
+    base_cols = ["TEAM_ID", "TEAM_NAME"] + [c for c in stat_cols if c in df.columns]
+    result = df[base_cols].copy()
+
+    for col in stat_cols:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce")
+
+    # Rank ascending=True → rank 30 = most allowed = worst defense (best for our props)
+    rank_pairs = [
+        ("OPP_PTS",     "OPP_PTS_RANK"),
+        ("OPP_REB",     "OPP_REB_RANK"),
+        ("OPP_AST",     "OPP_AST_RANK"),
+        ("OPP_FG3A",    "OPP_FG3A_RANK"),
+        ("OPP_FG3_PCT", "OPP_FG3_PCT_RANK"),
+        ("OPP_OREB",    "OPP_OREB_RANK"),
+    ]
+    for stat, rank in rank_pairs:
+        if stat in result.columns:
+            result[rank] = result[stat].rank(ascending=True, method="min").astype(int)
+
+    abbrev = _team_abbrev_map()
+    result["TEAM_ABBREVIATION"] = result["TEAM_ID"].map(abbrev)
+    return result.reset_index(drop=True)
+
+
+# ── Player Advanced Stats ─────────────────────────────────────────────────────
+
+def fetch_player_advanced_stats() -> pd.DataFrame:
+    """
+    Returns per-player advanced + base stats for current season:
+        PLAYER_ID, PLAYER_NAME, TEAM_ABBREVIATION,
+        USG_PCT, REB_PCT, AST_PCT,
+        FG3A_PER_GAME  (3-point attempts per game, from Base measure)
+
+    Used to qualify players for Points (usage), 3PM (volume), Assists (AST_PCT).
+    Returns empty DataFrame on failure — all callers must handle gracefully.
+    """
+    logger.info("Fetching player advanced stats (USG_PCT, REB_PCT, AST_PCT)...")
+    try:
+        time.sleep(0.6)
+        adv_ep = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=CURRENT_SEASON,
+            season_type_all_star=SEASON_TYPE,
+            measure_type_detailed_defense="Advanced",
+            per_mode_detailed="PerGame",
+        )
+        adv_df = adv_ep.get_data_frames()[0]
+
+        time.sleep(0.6)
+        base_ep = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=CURRENT_SEASON,
+            season_type_all_star=SEASON_TYPE,
+            measure_type_detailed_defense="Base",
+            per_mode_detailed="PerGame",
+        )
+        base_df = base_ep.get_data_frames()[0]
+    except Exception as exc:
+        logger.warning("Could not fetch player advanced stats: %s", exc)
+        return pd.DataFrame()
+
+    adv_want = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "USG_PCT", "REB_PCT", "AST_PCT"]
+    adv_result = adv_df[[c for c in adv_want if c in adv_df.columns]].copy()
+
+    if "FG3A" in base_df.columns and "PLAYER_ID" in base_df.columns:
+        base_result = base_df[["PLAYER_ID", "FG3A"]].copy()
+        base_result = base_result.rename(columns={"FG3A": "FG3A_PER_GAME"})
+        base_result["FG3A_PER_GAME"] = pd.to_numeric(base_result["FG3A_PER_GAME"], errors="coerce")
+        result = adv_result.merge(base_result, on="PLAYER_ID", how="left")
+    else:
+        result = adv_result
+
+    for col in ["USG_PCT", "REB_PCT", "AST_PCT"]:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce")
+
+    logger.info("  → Player advanced stats fetched for %d players.", len(result))
+    return result.reset_index(drop=True)

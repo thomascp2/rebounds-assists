@@ -26,8 +26,6 @@ from config import (
     ODDS_MARKET_COMBINED,
     ODDS_MARKET_REBOUNDS,
     ODDS_MARKET_ASSISTS,
-    ODDS_MARKET_POINTS,
-    ODDS_MARKET_3PM,
     ODDS_REGIONS,
     ODDS_BOOKMAKERS,
 )
@@ -255,79 +253,3 @@ def compute_consensus_lines(props_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return consensus
-
-
-# ── Multi-stat consensus lines ────────────────────────────────────────────────
-
-def _consensus_for_direct_market(
-    props_df: pd.DataFrame,
-    market_key: str,
-    stat_category: str,
-) -> pd.DataFrame:
-    """
-    Computes median Over line per player for a single direct market.
-    Returns DataFrame: player_name, consensus_line, num_books, books_listed, stat_category
-    """
-    mask = (props_df["market"] == market_key) & (props_df["side"] == "over")
-    sub = props_df[mask].copy()
-    sub["point"] = pd.to_numeric(sub["point"], errors="coerce")
-    sub = sub.dropna(subset=["point"])
-    if sub.empty:
-        return pd.DataFrame()
-
-    def _agg(group):
-        return pd.Series({
-            "consensus_line": group["point"].median(),
-            "num_books":      group["bookmaker"].nunique(),
-            "books_listed":   ", ".join(sorted(group["bookmaker"].unique())),
-        })
-
-    result = sub.groupby("player_name").apply(_agg).reset_index()
-    result["stat_category"] = stat_category
-    return result
-
-
-def compute_all_consensus_lines(props_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Computes consensus Over lines for all 5 stat categories in one pass.
-
-    - Rebs+Asts: two-pass (combined market → reb+ast split fallback)
-    - Points / Rebounds / Assists / 3PM: direct market lookup
-
-    Returns a combined DataFrame with columns:
-        player_name, consensus_line, num_books, books_listed, stat_category
-    """
-    if props_df.empty:
-        return pd.DataFrame()
-
-    frames = []
-
-    # Rebs+Asts — reuse existing two-pass logic
-    ra = compute_consensus_lines(props_df)
-    if not ra.empty:
-        ra = ra[["player_name", "consensus_line", "num_books", "books_listed"]].copy()
-        ra["stat_category"] = "Rebs+Asts"
-        frames.append(ra)
-
-    # Direct markets
-    for market_key, stat_cat in [
-        (ODDS_MARKET_POINTS,   "Points"),
-        (ODDS_MARKET_REBOUNDS, "Rebounds"),
-        (ODDS_MARKET_ASSISTS,  "Assists"),
-        (ODDS_MARKET_3PM,      "3PM"),
-    ]:
-        df = _consensus_for_direct_market(props_df, market_key, stat_cat)
-        if not df.empty:
-            frames.append(df)
-
-    if not frames:
-        logger.warning("No consensus lines found for any stat category.")
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-    logger.info(
-        "All-stat consensus lines: %d entries across categories: %s",
-        len(combined),
-        combined["stat_category"].value_counts().to_dict(),
-    )
-    return combined

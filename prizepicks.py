@@ -12,57 +12,30 @@ We parse both to build a flat DataFrame of NBA Rebs+Asts projections.
 """
 
 import logging
-import time
 from typing import Optional
 
 import requests
 import pandas as pd
 
-from config import PP_ENDPOINTS, PP_HEADERS, PP_LEAGUE_ID, PP_TARGET_STATS, PP_TARGET_STATS_EXPANDED
+from config import PP_PROJECTIONS_URL, PP_HEADERS, PP_LEAGUE_ID, PP_TARGET_STATS
 
 logger = logging.getLogger(__name__)
 
 
 def fetch_raw_projections(league_id: int = PP_LEAGUE_ID) -> dict:
     """
-    Tries partner-api.prizepicks.com first, falls back to api.prizepicks.com.
-    On 403, moves immediately to the next endpoint (bot protection on one != both).
-    Uses a plain requests.Session with app.prizepicks.com headers — same approach
-    proven to work in shared/prizepicks_client.py.
+    Hits the PrizePicks public projections endpoint and returns the raw JSON.
+    No authentication required.
     """
     params = {
         "league_id": league_id,
-        "per_page": 1000,
-        "single_stat": "true",
+        "per_page": 250,      # max per request; paginate if needed
+        "single_stat": True,  # include single-stat props
     }
-    session = requests.Session()
-    session.headers.update(PP_HEADERS)
-
     logger.info("Fetching PrizePicks board for league_id=%d...", league_id)
-    last_exc = None
-
-    for endpoint in PP_ENDPOINTS:
-        # 2s rate-limit between requests, matching shared client behaviour
-        time.sleep(2)
-        try:
-            resp = session.get(endpoint, params=params, timeout=30)
-            if resp.status_code == 200:
-                content_type = resp.headers.get("Content-Type", "")
-                if "application/json" in content_type:
-                    logger.info("  PrizePicks OK via %s", endpoint)
-                    return resp.json()
-                logger.warning("  Non-JSON response from %s, trying next.", endpoint)
-            elif resp.status_code == 403:
-                logger.warning("  403 from %s (bot protection), trying next.", endpoint)
-            else:
-                logger.warning("  HTTP %d from %s, trying next.", resp.status_code, endpoint)
-        except requests.RequestException as exc:
-            logger.warning("  Request error on %s: %s", endpoint, exc)
-            last_exc = exc
-
-    if last_exc:
-        raise last_exc
-    raise requests.HTTPError("All PrizePicks endpoints returned non-200 responses.")
+    resp = requests.get(PP_PROJECTIONS_URL, headers=PP_HEADERS, params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _parse_included(included: list) -> tuple[dict, dict]:
@@ -88,17 +61,12 @@ def _parse_included(included: list) -> tuple[dict, dict]:
             }
 
         elif obj_type == "game":
-            # Team abbreviations moved to metadata.game_info.teams in 2026 API
-            metadata = attrs.get("metadata", {})
-            teams = metadata.get("game_info", {}).get("teams", {})
-            away_abb = teams.get("away", {}).get("abbreviation", "")
-            home_abb = teams.get("home", {}).get("abbreviation", "")
-            game_label = f"{away_abb} @ {home_abb}" if away_abb and home_abb else ""
+            players_in_game = attrs.get("name", "")  # e.g. "BOS @ MIL"
             games[obj_id] = {
-                "game_label": game_label,
+                "game_label": players_in_game,
                 "start_time": attrs.get("start_time", ""),
-                "away_team": away_abb,
-                "home_team": home_abb,
+                "away_team": attrs.get("away_team_abbreviation", ""),
+                "home_team": attrs.get("home_team_abbreviation", ""),
             }
 
     return players, games
@@ -106,23 +74,20 @@ def _parse_included(included: list) -> tuple[dict, dict]:
 
 def _is_target_stat(stat_type: str) -> bool:
     """
-    Returns True if stat_type matches any of the 5 tracked categories:
-    Rebs+Asts, Points, Rebounds, Assists, 3PM.
+    Returns True if the stat_type string matches our Rebs+Asts targets.
+    PrizePicks uses various strings for this prop — we cast a wide net.
     """
-    normalized = stat_type.lower().replace(" ", "").replace("+", "").replace("-", "")
-    targets_normalized = {
-        s.lower().replace(" ", "").replace("+", "").replace("-", "")
-        for s in PP_TARGET_STATS_EXPANDED
-    }
-    extra = {"reboundsassists", "rebsasts", "ra", "reboundsplusassists",
-             "3pointsmade", "threepointersmade", "threes"}
+    normalized = stat_type.lower().replace(" ", "").replace("+", "")
+    targets_normalized = {s.lower().replace(" ", "").replace("+", "") for s in PP_TARGET_STATS}
+    # Also catch "reboundsassists" and partial matches
+    extra = {"reboundsassists", "rebsasts", "ra", "reboundsplusassists"}
     return normalized in targets_normalized | extra
 
 
-def fetch_nba_board() -> pd.DataFrame:
+def fetch_rebs_asts_board() -> pd.DataFrame:
     """
     Main entry point. Returns a flat DataFrame of all PrizePicks NBA
-    props across Points, Rebounds, Assists, Rebs+Asts, and 3PM with columns:
+    Rebs+Asts projections with columns:
 
         projection_id   — PrizePicks internal ID
         player_name     — Full display name
@@ -202,21 +167,16 @@ def fetch_nba_board() -> pd.DataFrame:
 
     if not rows:
         logger.warning(
-            "No qualifying props found on PrizePicks board. "
-            "Stat type strings may have changed — check PP_TARGET_STATS_EXPANDED in config.py."
+            "No Rebs+Asts props found on PrizePicks board. "
+            "Stat type strings may have changed — check PP_TARGET_STATS in config.py."
         )
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
     n_demon = df["is_demon"].sum()
     n_total = len(df)
-    stat_counts = df["stat_type"].value_counts().to_dict()
     logger.info(
-        "PrizePicks board: %d props (%d demons) — %s",
-        n_total, n_demon, stat_counts,
+        "PrizePicks board: %d Rebs+Asts props found (%d demons, %d standard).",
+        n_total, n_demon, n_total - n_demon,
     )
     return df.reset_index(drop=True)
-
-
-# Backwards-compat alias
-fetch_rebs_asts_board = fetch_nba_board
